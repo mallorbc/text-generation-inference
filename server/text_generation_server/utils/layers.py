@@ -51,7 +51,31 @@ def load_layer_norm_no_bias(cls, prefix, weights, eps):
     ln.bias = None
     return ln
 
+@classmethod
+def load_conv2d(cls, prefix, weights, in_channels, out_channels, kernel_size, stride):
+    weight = weights.get_tensor(f"{prefix}.weight")
+    bias = weights.get_tensor(f"{prefix}.bias")
+    with init_empty_weights():
+        conv2d = cls(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride)
 
+    conv2d.weight = nn.Parameter(weight)
+    conv2d.bias = nn.Parameter(bias)
+    return conv2d
+
+
+@classmethod
+def load_conv2d_no_bias(cls, prefix, weights, in_channels, out_channels, kernel_size, stride):
+    weight = weights.get_tensor(f"{prefix}.weight")
+    with init_empty_weights():
+        conv2d = cls(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride)
+
+    conv2d.weight = nn.Parameter(weight)
+    conv2d.bias = None
+    return conv2d
+
+
+torch.nn.Conv2d.load = load_conv2d
+torch.nn.Conv2d.load_no_bias = load_conv2d_no_bias
 torch.nn.LayerNorm.load = load_layer_norm
 torch.nn.LayerNorm.load_no_bias = load_layer_norm_no_bias
 
@@ -547,8 +571,6 @@ try:
                     self.inv_freq = _create_inv_freq(self.dim, newbase, self.inv_freq.device)
                 self._seq_len_cached = seqlen
                 t = torch.arange(seqlen, device=device, dtype=self.inv_freq.dtype)
-                if self.scaling_factor is not None:
-                    t /= self.scaling_factor
                 # Don't do einsum, it converts fp32 to fp16
                 # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
 
