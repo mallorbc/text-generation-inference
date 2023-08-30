@@ -1,19 +1,31 @@
 services:
   text-generation-inference:
-    image: ghcr.io/huggingface/text-generation-inference:1.0.0
+    image: text-generation-inference
     ports:
       - "8080:80"          
     volumes:
       - ${HOME}/.cache:/root/.cache
-    working_dir: /app
+      - ./models:/models
     container_name: text-generation-inference
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGINGFACE_HUB_CACHE=/root/.cache
     ipc: host
     deploy:
           resources:
             reservations:
               devices:
               - driver: "nvidia"
-                device_ids: ["0"]
+                device_ids: ["0,1"]
                 capabilities: [gpu]
     restart: unless-stopped
-    command: --model-id tiiuae/falcon-7b-instruct --huggingface-hub-cache /root/.cache/huggingface/hub
+    # entrypoint: /bin/bash -c
+    # command: "'sleep infinity'"
+    # command: --model-id /models/dob --huggingface-hub-cache /root/.cache/huggingface/hub  --trust-remote-code --quantize gptq
+    # command: --model-id /models/llama2_gptq --huggingface-hub-cache /root/.cache/huggingface/hub  --trust-remote-code --quantize gptq --max-input-length 4095 --max-total-tokens 4096
+    # command: --model-id meta-llama/Llama-2-7b-chat-hf --huggingface-hub-cache /root/.cache/huggingface/hub  --trust-remote-code --quantize bitsandbytes --max-input-length 4095 --max-total-tokens 4096
+    # command: --model-id meta-llama/Llama-2-70b-chat-hf --huggingface-hub-cache /root/.cache/huggingface/hub  --trust-remote-code --quantize bitsandbytes --max-input-length 1023 --max-total-tokens 1024 --max_batch_prefill_tokens 1024
+    # command: --model-id meta-llama/Llama-2-70b-chat-hf --huggingface-hub-cache /root/.cache/huggingface/hub  --trust-remote-code --quantize bitsandbytes-nf4 --max-input-length 4095 --max-total-tokens 4096
+    command: --model-id TheBloke/Llama-2-70B-chat-GPTQ --huggingface-hub-cache /root/.cache/huggingface/hub  --trust-remote-code --quantize gptq --max-input-length 4095 --max-total-tokens 4096
+
+
