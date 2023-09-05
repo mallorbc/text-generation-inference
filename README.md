@@ -2,7 +2,53 @@
 
 ![image](https://github.com/huggingface/text-generation-inference/assets/3841370/38ba1531-ea0d-4851-b31a-a6d4ddc944b0)
 
-# Text Generation Inference
+# Quickstart
+
+## Requirements
+
+You need docker, docker-compose, and nvidia-docker installed.
+
+You need a modern Nvidia GPU.
+
+## Running
+
+### Setup
+
+Open ```docker-compose.yml``` and modify the command section to reflect what model you want to run.  
+
+There are several commented examples on how to the model with various methods.
+
+There are many flags, but some of the more important ones are used in the command.
+
+```--model-id``` determines what model we are running.  It supports either a model on the huggingface hub, or a local model.
+
+```--huggingface-hub-cache``` is used with along with a docker-compose volume to prevent the need to redownload models from the hub each time we want to use them.
+
+```--trust-remote-code``` is required for some models to work.  Just be sure that you can trust the model that you are running.
+
+```--quantize``` is an optional flag that will reduce the memory reuqirements of the model and/or speed the model up.  The arguments that is supports are either ```bitsandbytes``` or ```gptq```.  The former should work with almost all models, while the later need the model to be converted before it will work.
+
+In my experience, GPTQ is faster, but bitsandbytes is easier and should have slightly better results due to the way it is done.
+
+
+You will also want to change the section about GPU ids.  Make sure that you are passing all the GPUs that you want as a list to the container
+
+
+### Lauching
+
+After you have configured everything, you can run the API simply by running ```docker-compose up -d```
+
+
+### Querying
+
+To use the API, reading the docs will be useful.  Most of the Huggingface Generate methods are supported.
+
+For quick usage, you can look at ```query_api.py``` and ```query_api_streaming.py```.  Both take a txt file as input with the ```-f``` flag.  
+
+The later program stream the token outputs like chatGPT does.
+
+
+# Text Generation Inference(Original README)
 
 <a href="https://github.com/huggingface/text-generation-inference">
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/huggingface/text-generation-inference?style=social">
