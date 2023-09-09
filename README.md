@@ -33,8 +33,14 @@ In my experience, GPTQ is faster, but bitsandbytes is easier and should have sli
 
 You will also want to change the section about GPU ids.  Make sure that you are passing all the GPUs that you want as a list to the container
 
+### Custom Models
 
-### Lauching
+For any custom models that you want to run, put them inside the ```models``` folder.
+
+You will then give the value of something like ```/models/custom_model``` for the ```--model-id``` flag
+
+
+### Launching
 
 After you have configured everything, you can run the API simply by running ```docker-compose up -d```
 
@@ -45,7 +51,7 @@ To use the API, reading the docs will be useful.  Most of the Huggingface Genera
 
 For quick usage, you can look at ```query_api.py``` and ```query_api_streaming.py```.  Both take a txt file as input with the ```-f``` flag.  
 
-The later program stream the token outputs like chatGPT does.
+The later program streams the token outputs as chatGPT does.
 
 
 # Text Generation Inference(Original README)
