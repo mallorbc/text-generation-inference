@@ -10,10 +10,9 @@ from typing import Optional, Tuple, List, Type, Dict
 from text_generation_server.models import Model
 from text_generation_server.models.types import (
     Batch,
-    PrefillTokens,
+    Tokens,
     Generation,
     GeneratedText,
-    TopTokens,
 )
 from text_generation_server.pb import generate_pb2
 from text_generation_server.utils import NextTokenChooser, StoppingCriteria, Sampling
@@ -511,7 +510,11 @@ class CausalLM(Model):
             load_in_8bit=quantize == "bitsandbytes",
             trust_remote_code=trust_remote_code,
         )
-        if torch.cuda.is_available() and torch.cuda.device_count() == 1 and quantize != "bitsandbytes":
+        if (
+            torch.cuda.is_available()
+            and torch.cuda.device_count() == 1
+            and quantize != "bitsandbytes"
+        ):
             model = model.cuda()
 
         if tokenizer.pad_token_id is None:
@@ -676,8 +679,11 @@ class CausalLM(Model):
                         clean_up_tokenization_spaces=False,
                         skip_special_tokens=False,
                     )
-                    prefill_tokens = PrefillTokens(
-                        prefill_token_ids, prefill_logprobs, prefill_texts
+                    prefill_tokens = Tokens(
+                        prefill_token_ids,
+                        prefill_logprobs,
+                        prefill_texts,
+                        is_special=[],
                     )
                 else:
                     prefill_tokens = None
@@ -691,7 +697,7 @@ class CausalLM(Model):
                     special_toptokens = [
                         token_id in self.all_special_ids for token_id in top_token_ids
                     ]
-                    top_tokens = TopTokens(
+                    top_tokens = Tokens(
                         top_token_ids,
                         top_token_logprobs,
                         toptoken_texts,
@@ -703,10 +709,12 @@ class CausalLM(Model):
                 generation = Generation(
                     request.id,
                     prefill_tokens,
-                    next_token_id_squeezed,
-                    next_token_logprob,
-                    next_token_text,
-                    next_token_id_squeezed.item() in self.all_special_ids,
+                    Tokens(
+                        [next_token_id_squeezed],
+                        [next_token_logprob],
+                        [next_token_text],
+                        [next_token_id_squeezed.item() in self.all_special_ids],
+                    ),
                     generated_text,
                     top_tokens,
                 )

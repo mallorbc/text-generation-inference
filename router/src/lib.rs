@@ -107,7 +107,7 @@ pub(crate) struct GenerateParameters {
     #[schema(default = "false", example = true)]
     pub do_sample: bool,
     #[serde(default = "default_max_new_tokens")]
-    #[schema(nullable = true, default = "null", example = "20")]
+    #[schema(nullable = true, default = "100", example = "20")]
     pub max_new_tokens: Option<u32>,
     #[serde(default)]
     #[schema(nullable = true, default = "null", example = false)]
@@ -141,7 +141,7 @@ pub(crate) struct GenerateParameters {
 }
 
 fn default_max_new_tokens() -> Option<u32> {
-    None
+    Some(100)
 }
 
 fn default_parameters() -> GenerateParameters {
@@ -300,15 +300,21 @@ mod tests {
     use tokenizers::Tokenizer;
 
     pub(crate) async fn get_tokenizer() -> Tokenizer {
-        if !std::path::Path::new("tokenizer.json").exists() {
+        let filename = std::path::Path::new("tokenizer.json");
+        if !filename.exists() {
             let content = reqwest::get("https://huggingface.co/gpt2/raw/main/tokenizer.json")
                 .await
                 .unwrap()
                 .bytes()
                 .await
                 .unwrap();
-            let mut file = std::fs::File::create("tokenizer.json").unwrap();
+            let tmp_filename = "tokenizer.json.temp";
+            let mut file = std::fs::File::create(tmp_filename).unwrap();
             file.write_all(&content).unwrap();
+            // Re-check if another process has written this file maybe.
+            if !filename.exists() {
+                std::fs::rename(tmp_filename, filename).unwrap()
+            }
         }
         Tokenizer::from_file("tokenizer.json").unwrap()
     }

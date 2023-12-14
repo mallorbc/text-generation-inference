@@ -20,7 +20,7 @@ from typing import Optional, Tuple, List, Type, Dict
 from text_generation_server.models import Model
 from text_generation_server.models.types import (
     Batch,
-    PrefillTokens,
+    Tokens,
     Generation,
     GeneratedText,
 )
@@ -583,7 +583,7 @@ class IdeficsCausalLM(Model):
 
         if torch.cuda.is_available():
             device = torch.device("cuda")
-            dtype = torch.float16 if dtype is None else dtype
+            dtype = torch.bfloat16 if dtype is None else dtype
         else:
             if quantize:
                 raise ValueError("quantization is not available on CPU")
@@ -791,8 +791,11 @@ class IdeficsCausalLM(Model):
                         clean_up_tokenization_spaces=False,
                         skip_special_tokens=False,
                     )
-                    prefill_tokens = PrefillTokens(
-                        prefill_token_ids, prefill_logprobs, prefill_texts
+                    prefill_tokens = Tokens(
+                        prefill_token_ids,
+                        prefill_logprobs,
+                        prefill_texts,
+                        is_special=[],
                     )
                 else:
                     prefill_tokens = None
@@ -802,10 +805,12 @@ class IdeficsCausalLM(Model):
                 generation = Generation(
                     request.id,
                     prefill_tokens,
-                    next_token_id_squeezed,
-                    next_token_logprob,
-                    next_token_text,
-                    next_token_id_squeezed.item() in self.all_special_ids,
+                    Tokens(
+                        [next_token_id_squeezed],
+                        [next_token_logprob],
+                        [next_token_text],
+                        [next_token_id_squeezed.item() in self.all_special_ids],
+                    ),
                     generated_text,
                     top_tokens,
                 )

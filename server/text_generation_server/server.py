@@ -132,6 +132,7 @@ def serve(
     revision: Optional[str],
     sharded: bool,
     quantize: Optional[str],
+    speculate: Optional[int],
     dtype: Optional[str],
     trust_remote_code: bool,
     uds_path: Path,
@@ -141,6 +142,7 @@ def serve(
         revision: Optional[str],
         sharded: bool = False,
         quantize: Optional[str] = None,
+        speculate: Optional[int] = None,
         dtype: Optional[str] = None,
         trust_remote_code: bool = False,
     ):
@@ -157,7 +159,13 @@ def serve(
 
         try:
             model = get_model(
-                model_id, revision, sharded, quantize, dtype, trust_remote_code
+                model_id,
+                revision,
+                sharded,
+                quantize,
+                speculate,
+                dtype,
+                trust_remote_code,
             )
         except Exception:
             logger.exception("Error when initializing model")
@@ -168,7 +176,7 @@ def serve(
                 # When using GPTQ, Exllama kernels need some global kernels
                 # For which we have the finale shapes only after the model has loaded
                 # This will allocate those buffers.
-                from text_generation_server.utils.gptq.exllama import (
+                from text_generation_server.utils.layers import (
                     create_exllama_buffers,
                     set_device,
                 )
@@ -205,5 +213,7 @@ def serve(
             await server.stop(0)
 
     asyncio.run(
-        serve_inner(model_id, revision, sharded, quantize, dtype, trust_remote_code)
+        serve_inner(
+            model_id, revision, sharded, quantize, speculate, dtype, trust_remote_code
+        )
     )
