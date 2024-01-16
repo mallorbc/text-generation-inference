@@ -21,12 +21,17 @@ services:
                 device_ids: ["0"]
                 capabilities: [gpu]
     restart: unless-stopped
+    networks:
+      - tgi
     #This is for bitsandbytes quantization
     # command: --model-id meta-llama/Llama-2-7b-hf --huggingface-hub-cache /root/.cache/huggingface/hub  --trust-remote-code --quantize bitsandbytes-nf4 --max-input-length 4095 --max-total-tokens 4096
 
     #This is for running a custom model with bitsand bytes quantization
     # command: --model-id /models/custom_model --huggingface-hub-cache /root/.cache/huggingface/hub  --trust-remote-code --quantize bitsandbytes-nf4 --max-input-length 4095 --max-total-tokens 4096
     
+    #This is for running a hugginngface hub model with gptq quantization
+    # command: --model-id TheBloke/Llama-2-70B-chat-GPTQ --huggingface-hub-cache /root/.cache/huggingface/hub  --trust-remote-code --quantize gptq --max-input-length 4095 --max-total-tokens 4096
+
 networks:
   tgi:
-    name: tgi-network  
+    name: tgi-network
