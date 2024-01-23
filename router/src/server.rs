@@ -2,11 +2,11 @@
 use crate::health::Health;
 use crate::infer::{InferError, InferResponse, InferStreamResponse};
 use crate::validation::ValidationError;
-use crate::HubTokenizerConfig;
 use crate::{
     BestOfSequence, ChatCompletion, ChatCompletionChunk, ChatRequest, CompatGenerateRequest,
     Details, ErrorResponse, FinishReason, GenerateParameters, GenerateRequest, GenerateResponse,
-    HubModelInfo, Infer, Info, PrefillToken, StreamDetails, StreamResponse, Token, Validation,
+    HubModelInfo, HubTokenizerConfig, Infer, Info, PrefillToken, StreamDetails, StreamResponse,
+    Token, Validation,
 };
 use axum::extract::Extension;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -572,7 +572,7 @@ async fn chat_completions(
     let seed = req.seed;
 
     // apply chat template to flatten the request into a single input
-    let inputs = match infer.apply_chat_template(req) {
+    let inputs = match infer.apply_chat_template(req.messages) {
         Ok(inputs) => inputs,
         Err(err) => {
             metrics::increment_counter!("tgi_request_failure", "err" => "validation");
@@ -659,9 +659,9 @@ async fn chat_completions(
 
         // build the complete response object with the full text
         let response = ChatCompletion::new(
-            generation.generated_text,
             model_id,
             system_fingerprint,
+            generation.generated_text,
             current_time,
             generation.details.unwrap(),
             logprobs,
@@ -708,6 +708,7 @@ pub async fn run(
     ngrok_authtoken: Option<String>,
     ngrok_edge: Option<String>,
     tokenizer_config: HubTokenizerConfig,
+    chat_enabled_api: bool,
 ) -> Result<(), axum::BoxError> {
     // OpenAPI documentation
     #[derive(OpenApi)]
@@ -856,25 +857,32 @@ pub async fn run(
         docker_label: option_env!("DOCKER_LABEL"),
     };
 
-    // Create router
-    let app = Router::new()
-        .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()))
-        // Base routes
+    // Configure Swagger UI
+    let swagger_ui = SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi());
+
+    // Define base and health routes
+    let base_routes = Router::new()
         .route("/", post(compat_generate))
         .route("/info", get(get_model_info))
         .route("/generate", post(generate))
         .route("/generate_stream", post(generate_stream))
         .route("/v1/chat/completions", post(chat_completions))
-        // AWS Sagemaker route
-        .route("/invocations", post(compat_generate))
-        // Base Health route
         .route("/health", get(health))
-        // Inference API health route
-        .route("/", get(health))
-        // AWS Sagemaker health route
         .route("/ping", get(health))
-        // Prometheus metrics route
-        .route("/metrics", get(metrics))
+        .route("/metrics", get(metrics));
+
+    // Conditional AWS Sagemaker route
+    let aws_sagemaker_route = if chat_enabled_api {
+        Router::new().route("/invocations", post(chat_completions)) // Use 'chat_completions' for OAI_ENABLED
+    } else {
+        Router::new().route("/invocations", post(compat_generate)) // Use 'compat_generate' otherwise
+    };
+
+    // Combine routes and layers
+    let app = Router::new()
+        .merge(swagger_ui)
+        .merge(base_routes)
+        .merge(aws_sagemaker_route)
         .layer(Extension(info))
         .layer(Extension(health_ext.clone()))
         .layer(Extension(compat_return_full_text))
