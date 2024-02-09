@@ -105,6 +105,7 @@ impl Client {
         max_input_length: u32,
         max_prefill_tokens: u32,
         max_total_tokens: u32,
+        max_batch_size: Option<usize>,
     ) -> Result<Option<u32>> {
         let mut n_tokens = 0;
         let mut requests = Vec::new();
@@ -125,6 +126,7 @@ impl Client {
                     do_sample: false,
                     seed: 0,
                     repetition_penalty: 1.2,
+                    frequency_penalty: 0.1,
                     watermark: true,
                 }),
                 stopping_parameters: Some(StoppingCriteriaParameters {
@@ -136,6 +138,11 @@ impl Client {
                 top_n_tokens: 20,
             });
             n_tokens += max_input_length;
+
+            // Check max_batch_size
+            if Some(requests.len()) == max_batch_size {
+                break;
+            }
         }
 
         let batch = Batch {

@@ -61,6 +61,7 @@ impl Infer {
         max_batch_prefill_tokens: u32,
         max_batch_total_tokens: u32,
         max_waiting_tokens: usize,
+        max_batch_size: Option<usize>,
         max_concurrent_requests: usize,
         requires_padding: bool,
         window_size: Option<u32>,
@@ -81,6 +82,7 @@ impl Infer {
             max_batch_prefill_tokens,
             max_batch_total_tokens,
             max_waiting_tokens,
+            max_batch_size,
             queue.clone(),
             shared.clone(),
             generation_health,
@@ -165,6 +167,28 @@ impl Infer {
         ))
     }
 
+    /// Tokenizer the input
+    #[instrument(skip_all)]
+    pub(crate) async fn tokenize(
+        &self,
+        request: GenerateRequest,
+    ) -> Result<Option<tokenizers::Encoding>, InferError> {
+        // Tokenize request
+        let inputs = request.inputs;
+        let truncate = request.parameters.truncate;
+        let encoding = self
+            .validation
+            .tokenize(inputs, truncate)
+            .await
+            .map_err(|err| {
+                tracing::error!("Tokenization {err}");
+                err
+            })?;
+
+        // Return Encoding
+        Ok(encoding.map(|(encoding, _)| encoding))
+    }
+
     /// Apply the chat template to the chat request
     #[instrument(skip_all)]
     pub(crate) fn apply_chat_template(&self, messages: Vec<Message>) -> Result<String, InferError> {
@@ -176,6 +200,7 @@ impl Infer {
                 messages,
                 eos_token: eos_token.as_deref(),
                 bos_token: bos_token.as_deref(),
+                add_generation_prompt: true,
             })
             .map_err(|e| {
                 metrics::increment_counter!("tgi_request_failure", "err" => "template");
@@ -315,6 +340,7 @@ async fn batching_task(
     max_batch_prefill_tokens: u32,
     max_batch_total_tokens: u32,
     max_waiting_tokens: usize,
+    max_batch_size: Option<usize>,
     queue: Queue,
     shared: Arc<Shared>,
     generation_health: Arc<AtomicBool>,
@@ -328,7 +354,12 @@ async fn batching_task(
         // This batch might be smaller than the maximum batch size if there are not enough requests
         // waiting in the queue
         while let Some((mut entries, batch, span)) = queue
-            .next_batch(None, max_batch_prefill_tokens, max_batch_total_tokens)
+            .next_batch(
+                None,
+                max_batch_size,
+                max_batch_prefill_tokens,
+                max_batch_total_tokens,
+            )
             .await
         {
             let mut cached_batch = prefill(&mut client, batch, &mut entries, &generation_health)
@@ -356,10 +387,11 @@ async fn batching_task(
                 };
 
                 let token_budget = max_batch_total_tokens.saturating_sub(batch_max_tokens);
+                let max_size = max_batch_size.map(|max_size| max_size - batch_size as usize);
 
                 // Try to get a new batch
                 if let Some((mut new_entries, new_batch, span)) = queue
-                    .next_batch(min_size, max_batch_prefill_tokens, token_budget)
+                    .next_batch(min_size, max_size, max_batch_prefill_tokens, token_budget)
                     .await
                 {
                     // Tracking metrics
@@ -784,21 +816,14 @@ mod tests {
             ],
             bos_token: Some("[BOS]"),
             eos_token: Some("[EOS]"),
+            add_generation_prompt: true,
         };
 
         let result = tmpl.unwrap().render(chat_template_inputs).unwrap();
 
         assert_eq!(
             result,
-            r#"### User:
-Hi!
-
-### Assistant:
-Hello how can I help?### User:
-What is Deep Learning?
-
-### Assistant:
-magic!"#
+            "### User:\nHi!\n\n### Assistant:\nHello how can I help?### User:\nWhat is Deep Learning?\n\n### Assistant:\nmagic!### Assistant:\n"
         );
     }
 
@@ -856,6 +881,7 @@ magic!"#
             ],
             bos_token: Some("[BOS]"),
             eos_token: Some("[EOS]"),
+            add_generation_prompt: true,
         };
 
         let result = tmpl.unwrap().render(chat_template_inputs); //.err().unwrap();
@@ -921,9 +947,60 @@ magic!"#
             ],
             bos_token: Some("[BOS]"),
             eos_token: Some("[EOS]"),
+            add_generation_prompt: true,
         };
 
         let result = tmpl.unwrap().render(chat_template_inputs).unwrap();
         assert_eq!(result, "[BOS][INST] Hi! [/INST]Hello how can I help?[EOS][INST] What is Deep Learning? [/INST]magic![EOS]");
+    }
+
+    #[test]
+    fn test_chat_template_valid_with_add_generation_prompt() {
+        let mut env = Environment::new();
+        env.add_function("raise_exception", raise_exception);
+
+        let source = r#"
+        {% for message in messages %}
+        {{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}
+        {% endfor %}
+        {% if add_generation_prompt %}
+            {{ '<|im_start|>assistant\n' }}
+        {% endif %}"#;
+
+        // trim all the whitespace
+        let source = source
+            .lines()
+            .map(|line| line.trim())
+            .collect::<Vec<&str>>()
+            .join("");
+
+        let tmpl = env.template_from_str(&source);
+
+        let chat_template_inputs = ChatTemplateInputs {
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: "Hi!".to_string(),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: "Hello how can I help?".to_string(),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: "What is Deep Learning?".to_string(),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: "magic!".to_string(),
+                },
+            ],
+            bos_token: Some("[BOS]"),
+            eos_token: Some("[EOS]"),
+            add_generation_prompt: true,
+        };
+
+        let result = tmpl.unwrap().render(chat_template_inputs).unwrap();
+        assert_eq!(result, "<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\nHello how can I help?<|im_end|>\n<|im_start|>user\nWhat is Deep Learning?<|im_end|>\n<|im_start|>assistant\nmagic!<|im_end|>\n<|im_start|>assistant\n");
     }
 }

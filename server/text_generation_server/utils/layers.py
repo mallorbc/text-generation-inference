@@ -33,14 +33,14 @@ except Exception:
     major = 1
 
 HAS_EXLLAMA = False
-CAN_EXLLAMA = major >= 8
+CAN_EXLLAMA = major >= 8 or IS_ROCM_SYSTEM
 V2 = os.getenv("EXLLAMA_VERSION", "2") == "2"
-if V2 and int(os.getenv("WORLD_SIZE", "1")) > 1:
-    V2 = False
-    log_once(
-        logger.warning,
-        "Disabling exllama v2 and using v1 instead because there are issues when sharding",
-    )
+# if V2 and int(os.getenv("WORLD_SIZE", "1")) > 1:
+#     V2 = False
+#     log_once(
+#         logger.warning,
+#         "Disabling exllama v2 and using v1 instead because there are issues when sharding",
+#     )
 
 if os.getenv("DISABLE_EXLLAMA") == "True":
     HAS_EXLLAMA = False
@@ -349,6 +349,13 @@ def get_linear(weight, bias, quantize):
             raise NotImplementedError(
                 f"The passed weight is not `awq` compatible, loader needs to be updated."
             )
+        if IS_ROCM_SYSTEM:
+            raise NotImplementedError(
+                "AWQ GEMM kernel can't be used on ROCm systems, please use `--quantize gptq` instead "
+                "to use Exllama/GPTQ kernels for AWQ inference."
+            )
+        if not HAS_AWQ:
+            raise NotImplementedError("You do not seem to have awq installed, either install it (cd server &&  make install-awq), or try using GPTQ `---quantize gptq` a conversion AWQ->GPTQ will happen on the fly")
         linear = WQLinear(
             w_bit=bits,
             group_size=groupsize,
@@ -507,10 +514,12 @@ class TensorParallelEmbedding(nn.Module):
         world_size = process_group.size()
         rank = process_group.rank()
 
-        block_size = num_embeddings // world_size
+        block_size = (num_embeddings + world_size - 1) // world_size
         self.min_id = rank * block_size
         self.max_id = min(num_embeddings, (rank + 1) * block_size)
-        self.null_idx = block_size
+        self.null_idx = weight.shape[
+            0
+        ]  # Usually block_size, might be less in non even vocab_size.
         self.process_group = weights.process_group
         self.reduce = reduce
 

@@ -45,6 +45,8 @@ struct Args {
     max_batch_total_tokens: Option<u32>,
     #[clap(default_value = "20", long, env)]
     max_waiting_tokens: usize,
+    #[clap(long, env)]
+    max_batch_size: Option<usize>,
     #[clap(default_value = "0.0.0.0", long, env)]
     hostname: String,
     #[clap(default_value = "3000", long, short, env)]
@@ -72,7 +74,7 @@ struct Args {
     #[clap(long, env)]
     ngrok_edge: Option<String>,
     #[clap(long, env, default_value_t = false)]
-    chat_enabled_api: bool,
+    messages_api_enabled: bool,
 }
 
 #[tokio::main]
@@ -91,6 +93,7 @@ async fn main() -> Result<(), RouterError> {
         max_batch_prefill_tokens,
         max_batch_total_tokens,
         max_waiting_tokens,
+        max_batch_size,
         hostname,
         port,
         master_shard_uds_path,
@@ -104,7 +107,7 @@ async fn main() -> Result<(), RouterError> {
         ngrok,
         ngrok_authtoken,
         ngrok_edge,
-        chat_enabled_api,
+        messages_api_enabled,
     } = args;
 
     // Launch Tokio runtime
@@ -153,12 +156,6 @@ async fn main() -> Result<(), RouterError> {
     // This will only be used to validate payloads
     let local_path = Path::new(&tokenizer_name);
     let local_model = local_path.exists() && local_path.is_dir();
-
-    // Load tokenizer config
-    // This will be used to format the chat template
-    let local_tokenizer_config_path =
-        tokenizer_config_path.unwrap_or("tokenizer_config.json".to_string());
-    let local_tokenizer_config = Path::new(&local_tokenizer_config_path).exists();
 
     // Shared API builder initialization
     let api_builder = || {
@@ -230,24 +227,35 @@ async fn main() -> Result<(), RouterError> {
     };
 
     // Load tokenizer config if found locally, or check if we can get it from the API if needed
-    let tokenizer_config = if local_tokenizer_config {
+    let tokenizer_config = if let Some(path) = tokenizer_config_path {
+        tracing::info!("Using local tokenizer config from user specified path");
+        HubTokenizerConfig::from_file(&std::path::PathBuf::from(path))
+    } else if local_model {
         tracing::info!("Using local tokenizer config");
-        HubTokenizerConfig::from_file(&local_tokenizer_config_path)
-    } else if let Some(api) = api {
-        tracing::info!("Using the Hugging Face API to retrieve tokenizer config");
-        get_tokenizer_config(&api.repo(Repo::with_revision(
-            tokenizer_name.to_string(),
-            RepoType::Model,
-            revision.unwrap_or_else(|| "main".to_string()),
-        )))
-        .await
-        .unwrap_or_else(|| {
-            tracing::warn!("Could not retrieve tokenizer config from the Hugging Face hub.");
-            HubTokenizerConfig::default()
-        })
+        HubTokenizerConfig::from_file(&local_path.join("tokenizer_config.json"))
     } else {
-        tracing::warn!("Could not find tokenizer config locally and no revision specified");
-        HubTokenizerConfig::default()
+        match api {
+            Some(api) => {
+                tracing::info!("Using the Hugging Face API to retrieve tokenizer config");
+                let repo = Repo::with_revision(
+                    tokenizer_name.to_string(),
+                    RepoType::Model,
+                    revision.unwrap_or("main".to_string()),
+                );
+                get_tokenizer_config(&api.repo(repo))
+                    .await
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            "Could not retrieve tokenizer config from the Hugging Face hub."
+                        );
+                        HubTokenizerConfig::default()
+                    })
+            }
+            None => {
+                tracing::warn!("Could not find tokenizer config locally and no API specified");
+                HubTokenizerConfig::default()
+            }
+        }
     };
 
     if tokenizer.is_none() {
@@ -283,6 +291,7 @@ async fn main() -> Result<(), RouterError> {
             max_input_length as u32,
             max_batch_prefill_tokens,
             max_total_tokens as u32,
+            max_batch_size,
         )
         .await
         .map_err(RouterError::Warmup)?
@@ -339,6 +348,7 @@ async fn main() -> Result<(), RouterError> {
         max_batch_prefill_tokens,
         max_supported_batch_total_tokens,
         max_waiting_tokens,
+        max_batch_size,
         sharded_client,
         tokenizer,
         validation_workers,
@@ -348,7 +358,7 @@ async fn main() -> Result<(), RouterError> {
         ngrok_authtoken,
         ngrok_edge,
         tokenizer_config,
-        chat_enabled_api,
+        messages_api_enabled,
     )
     .await?;
     Ok(())
@@ -462,7 +472,12 @@ pub async fn get_tokenizer_config(api_repo: &ApiRepo) -> Option<HubTokenizerConf
     let reader = BufReader::new(file);
 
     // Read the JSON contents of the file as an instance of 'HubTokenizerConfig'.
-    let tokenizer_config: HubTokenizerConfig = serde_json::from_reader(reader).ok()?;
+    let tokenizer_config: HubTokenizerConfig = serde_json::from_reader(reader)
+        .map_err(|e| {
+            tracing::warn!("Unable to parse tokenizer config: {}", e);
+            e
+        })
+        .ok()?;
 
     Some(tokenizer_config)
 }

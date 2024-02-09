@@ -3,10 +3,11 @@ use crate::health::Health;
 use crate::infer::{InferError, InferResponse, InferStreamResponse};
 use crate::validation::ValidationError;
 use crate::{
-    BestOfSequence, ChatCompletion, ChatCompletionChunk, ChatRequest, CompatGenerateRequest,
-    Details, ErrorResponse, FinishReason, GenerateParameters, GenerateRequest, GenerateResponse,
-    HubModelInfo, HubTokenizerConfig, Infer, Info, PrefillToken, StreamDetails, StreamResponse,
-    Token, Validation,
+    BestOfSequence, ChatCompletion, ChatCompletionChoice, ChatCompletionChunk, ChatCompletionDelta,
+    ChatCompletionLogprobs, ChatRequest, CompatGenerateRequest, Details, ErrorResponse,
+    FinishReason, GenerateParameters, GenerateRequest, GenerateResponse, HubModelInfo,
+    HubTokenizerConfig, Infer, Info, Message, PrefillToken, SimpleToken, StreamDetails,
+    StreamResponse, Token, TokenizeResponse, Validation,
 };
 use axum::extract::Extension;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -57,6 +58,7 @@ example = json ! ({"error": "Incomplete generation"})),
 async fn compat_generate(
     Extension(default_return_full_text): Extension<bool>,
     infer: Extension<Infer>,
+    compute_type: Extension<ComputeType>,
     Json(mut req): Json<CompatGenerateRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     // default return_full_text given the pipeline_tag
@@ -66,11 +68,11 @@ async fn compat_generate(
 
     // switch on stream
     if req.stream {
-        Ok(generate_stream(infer, Json(req.into()))
+        Ok(generate_stream(infer, compute_type, Json(req.into()))
             .await
             .into_response())
     } else {
-        let (headers, Json(generation)) = generate(infer, Json(req.into())).await?;
+        let (headers, Json(generation)) = generate(infer, compute_type, Json(req.into())).await?;
         // wrap generation inside a Vec to match api-inference
         Ok((headers, Json(vec![generation])).into_response())
     }
@@ -145,6 +147,7 @@ seed,
 )]
 async fn generate(
     infer: Extension<Infer>,
+    Extension(ComputeType(compute_type)): Extension<ComputeType>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<(HeaderMap, Json<GenerateResponse>), (StatusCode, Json<ErrorResponse>)> {
     let span = tracing::Span::current();
@@ -230,7 +233,7 @@ async fn generate(
 
     // Headers
     let mut headers = HeaderMap::new();
-    headers.insert("x-compute-type", "gpu+optimized".parse().unwrap());
+    headers.insert("x-compute-type", compute_type.parse().unwrap());
     headers.insert(
         "x-compute-time",
         total_time.as_millis().to_string().parse().unwrap(),
@@ -339,6 +342,7 @@ seed,
 )]
 async fn generate_stream(
     Extension(infer): Extension<Infer>,
+    Extension(compute_type): Extension<ComputeType>,
     Json(req): Json<GenerateRequest>,
 ) -> (
     HeaderMap,
@@ -349,13 +353,14 @@ async fn generate_stream(
         event.json_data(stream_token).unwrap()
     };
     let (headers, response_stream) =
-        generate_stream_internal(infer, Json(req), on_message_callback).await;
+        generate_stream_internal(infer, compute_type, Json(req), on_message_callback).await;
     let sse = Sse::new(response_stream).keep_alive(KeepAlive::default());
     (headers, sse)
 }
 
 async fn generate_stream_internal(
     infer: Infer,
+    ComputeType(compute_type): ComputeType,
     Json(req): Json<GenerateRequest>,
     on_message_callback: impl Fn(StreamResponse) -> Event,
 ) -> (HeaderMap, impl Stream<Item = Result<Event, Infallible>>) {
@@ -368,7 +373,7 @@ async fn generate_stream_internal(
     let compute_characters = req.inputs.chars().count();
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-compute-type", "gpu+optimized".parse().unwrap());
+    headers.insert("x-compute-type", compute_type.parse().unwrap());
     headers.insert(
         "x-compute-characters",
         compute_characters.to_string().parse().unwrap(),
@@ -532,7 +537,7 @@ async fn generate_stream_internal(
     path = "/v1/chat/completions",
     request_body = ChatRequest,
     responses(
-    (status = 200, description = "Generated Text", body = GenerateResponse),
+    (status = 200, description = "Generated Text", body = ChatCompletionChunk),
     (status = 424, description = "Generation Error", body = ErrorResponse,
     example = json ! ({"error": "Request failed during generation"})),
     (status = 429, description = "Model is overloaded", body = ErrorResponse,
@@ -557,6 +562,7 @@ async fn generate_stream_internal(
     )]
 async fn chat_completions(
     Extension(infer): Extension<Infer>,
+    Extension(compute_type): Extension<ComputeType>,
     Extension(info): Extension<Info>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
@@ -565,8 +571,8 @@ async fn chat_completions(
     let stream = req.stream;
     let max_new_tokens = req.max_tokens.or(Some(100));
     let repetition_penalty = req
-        .frequency_penalty
-        // rescale frequency_penalty from (-2.0, 2.0) to (0.0, 4.0)
+        .presence_penalty
+        // rescale repetition_penalty from (-2.0, 2.0) to (0.0, 4.0)
         .map(|x| x + 2.0);
     let logprobs = req.logprobs.unwrap_or(false);
     let seed = req.seed;
@@ -592,10 +598,11 @@ async fn chat_completions(
         inputs: inputs.to_string(),
         parameters: GenerateParameters {
             best_of: None,
-            temperature: None,
+            temperature: req.temperature,
             repetition_penalty,
+            frequency_penalty: req.frequency_penalty,
             top_k: None,
-            top_p: None,
+            top_p: req.top_p,
             typical_p: None,
             do_sample: true,
             max_new_tokens,
@@ -604,7 +611,7 @@ async fn chat_completions(
             truncate: None,
             watermark: false,
             details: true,
-            decoder_input_details: true,
+            decoder_input_details: !stream,
             seed,
             top_n_tokens: None,
         },
@@ -625,6 +632,10 @@ async fn chat_completions(
                 .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                 .as_secs();
 
+            let logprobs = logprobs.then(|| {
+                ChatCompletionLogprobs::from((stream_token.token.clone(), stream_token.top_tokens))
+            });
+
             event
                 .json_data(ChatCompletionChunk::new(
                     model_id.clone(),
@@ -632,7 +643,7 @@ async fn chat_completions(
                     stream_token.token.text,
                     current_time,
                     stream_token.index,
-                    logprobs.then_some(stream_token.token.logprob),
+                    logprobs,
                     stream_token.details.map(|d| d.finish_reason.to_string()),
                 ))
                 .map_or_else(
@@ -644,13 +655,22 @@ async fn chat_completions(
                 )
         };
 
-        let (headers, response_stream) =
-            generate_stream_internal(infer, Json(generate_request), on_message_callback).await;
+        let (headers, response_stream) = generate_stream_internal(
+            infer,
+            compute_type,
+            Json(generate_request),
+            on_message_callback,
+        )
+        .await;
         let sse = Sse::new(response_stream).keep_alive(KeepAlive::default());
         Ok((headers, sse).into_response())
     } else {
-        let (headers, Json(generation)) =
-            generate(Extension(infer), Json(generate_request)).await?;
+        let (headers, Json(generation)) = generate(
+            Extension(infer),
+            Extension(compute_type),
+            Json(generate_request),
+        )
+        .await?;
 
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -672,6 +692,52 @@ async fn chat_completions(
     }
 }
 
+/// Tokenize inputs
+#[utoipa::path(
+    post,
+    tag = "Text Generation Inference",
+    path = "/tokenize",
+    request_body = GenerateRequest,
+    responses(
+    (status = 200, description = "Tokenized ids", body = TokenizeResponse),
+    (status = 404, description = "No tokenizer found", body = ErrorResponse,
+    example = json ! ({"error": "No fast tokenizer available"})),
+    )
+    )]
+#[instrument(skip_all)]
+async fn tokenize(
+    Extension(infer): Extension<Infer>,
+    Json(req): Json<GenerateRequest>,
+) -> Result<Json<TokenizeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let input = req.inputs.clone();
+    let encoding = infer.tokenize(req).await?;
+    if let Some(encoding) = encoding {
+        let tokens: Vec<SimpleToken> = encoding
+            .get_ids()
+            .iter()
+            .zip(encoding.get_offsets())
+            .map(|(&id, &(start, stop))| {
+                let text: String = input.chars().skip(start).take(stop - start).collect();
+                SimpleToken {
+                    id,
+                    text,
+                    start,
+                    stop,
+                }
+            })
+            .collect();
+        Ok(Json(TokenizeResponse(tokens)))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "No fast tokenizer or tokenizer.json for this model".to_string(),
+                error_type: "no fast tokenizer".to_string(),
+            }),
+        ))
+    }
+}
+
 /// Prometheus metrics scrape endpoint
 #[utoipa::path(
 get,
@@ -682,6 +748,9 @@ responses((status = 200, description = "Prometheus Metrics", body = String))
 async fn metrics(prom_handle: Extension<PrometheusHandle>) -> String {
     prom_handle.render()
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct ComputeType(String);
 
 /// Serving method
 #[allow(clippy::too_many_arguments)]
@@ -699,6 +768,7 @@ pub async fn run(
     max_batch_prefill_tokens: u32,
     max_batch_total_tokens: u32,
     max_waiting_tokens: usize,
+    max_batch_size: Option<usize>,
     client: ShardedClient,
     tokenizer: Option<Tokenizer>,
     validation_workers: usize,
@@ -708,7 +778,7 @@ pub async fn run(
     ngrok_authtoken: Option<String>,
     ngrok_edge: Option<String>,
     tokenizer_config: HubTokenizerConfig,
-    chat_enabled_api: bool,
+    messages_api_enabled: bool,
 ) -> Result<(), axum::BoxError> {
     // OpenAPI documentation
     #[derive(OpenApi)]
@@ -719,6 +789,8 @@ pub async fn run(
     compat_generate,
     generate,
     generate_stream,
+    chat_completions,
+    tokenize,
     metrics,
     ),
     components(
@@ -726,10 +798,18 @@ pub async fn run(
     Info,
     CompatGenerateRequest,
     GenerateRequest,
+    ChatRequest,
+    Message,
+    ChatCompletionChoice,
+    ChatCompletionDelta,
+    ChatCompletionChunk,
+    ChatCompletion,
     GenerateParameters,
     PrefillToken,
     Token,
     GenerateResponse,
+    TokenizeResponse,
+    SimpleToken,
     BestOfSequence,
     Details,
     FinishReason,
@@ -770,6 +850,7 @@ pub async fn run(
         max_batch_prefill_tokens,
         max_batch_total_tokens,
         max_waiting_tokens,
+        max_batch_size,
         max_concurrent_requests,
         shard_info.requires_padding,
         shard_info.window_size,
@@ -851,6 +932,7 @@ pub async fn run(
         waiting_served_ratio,
         max_batch_total_tokens,
         max_waiting_tokens,
+        max_batch_size,
         validation_workers,
         version: env!("CARGO_PKG_VERSION"),
         sha: option_env!("VERGEN_GIT_SHA"),
@@ -863,20 +945,25 @@ pub async fn run(
     // Define base and health routes
     let base_routes = Router::new()
         .route("/", post(compat_generate))
+        .route("/", get(health))
         .route("/info", get(get_model_info))
         .route("/generate", post(generate))
         .route("/generate_stream", post(generate_stream))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/tokenize", post(tokenize))
         .route("/health", get(health))
         .route("/ping", get(health))
         .route("/metrics", get(metrics));
 
     // Conditional AWS Sagemaker route
-    let aws_sagemaker_route = if chat_enabled_api {
+    let aws_sagemaker_route = if messages_api_enabled {
         Router::new().route("/invocations", post(chat_completions)) // Use 'chat_completions' for OAI_ENABLED
     } else {
         Router::new().route("/invocations", post(compat_generate)) // Use 'compat_generate' otherwise
     };
+
+    let compute_type =
+        ComputeType(std::env::var("COMPUTE_TYPE").unwrap_or("gpu+optimized".to_string()));
 
     // Combine routes and layers
     let app = Router::new()
@@ -887,6 +974,7 @@ pub async fn run(
         .layer(Extension(health_ext.clone()))
         .layer(Extension(compat_return_full_text))
         .layer(Extension(infer))
+        .layer(Extension(compute_type))
         .layer(Extension(prom_handle.clone()))
         .layer(OtelAxumLayer::default())
         .layer(cors_layer);
