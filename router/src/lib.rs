@@ -20,6 +20,25 @@ pub(crate) type GenerateStreamResponse = (
     UnboundedReceiverStream<Result<InferStreamResponse, InferError>>,
 );
 
+#[derive(Clone, Deserialize, ToSchema)]
+pub(crate) struct VertexInstance {
+    #[schema(example = "What is Deep Learning?")]
+    pub inputs: String,
+    #[schema(nullable = true, default = "null", example = "null")]
+    pub parameters: Option<GenerateParameters>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct VertexRequest {
+    #[serde(rename = "instances")]
+    pub instances: Vec<VertexInstance>,
+}
+
+#[derive(Clone, Deserialize, ToSchema, Serialize)]
+pub(crate) struct VertexResponse {
+    pub predictions: Vec<String>,
+}
+
 /// Hub type
 #[derive(Clone, Debug, Deserialize)]
 pub struct HubModelInfo {
@@ -32,7 +51,9 @@ pub struct HubModelInfo {
 #[derive(Clone, Deserialize, Default)]
 pub struct HubTokenizerConfig {
     pub chat_template: Option<String>,
+    #[serde(deserialize_with = "token_serde::deserialize")]
     pub bos_token: Option<String>,
+    #[serde(deserialize_with = "token_serde::deserialize")]
     pub eos_token: Option<String>,
 }
 
@@ -40,6 +61,71 @@ impl HubTokenizerConfig {
     pub fn from_file(filename: &std::path::Path) -> Self {
         let content = std::fs::read_to_string(filename).unwrap();
         serde_json::from_str(&content).unwrap_or_default()
+    }
+}
+
+mod json_object_or_string_to_string {
+    use serde::{Deserialize, Deserializer};
+    use serde_json::Value;
+
+    // A custom deserializer that treats both strings and objects as strings.
+    // This provides flexibility with input formats for the 'grammar' field.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+
+        match value {
+            Value::String(s) => Ok(s),
+            // Safely handle serialization and return an error if it fails
+            Value::Object(o) => {
+                serde_json::to_string(&o).map_err(|e| serde::de::Error::custom(e.to_string()))
+            }
+            _ => Err(serde::de::Error::custom(
+                "expected string or object for grammar",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(tag = "type", content = "value")]
+pub(crate) enum GrammarType {
+    #[serde(
+        rename = "json",
+        deserialize_with = "json_object_or_string_to_string::deserialize"
+    )]
+    Json(String),
+    #[serde(rename = "regex")]
+    Regex(String),
+}
+
+mod token_serde {
+    use super::*;
+    use serde::de;
+    use serde::Deserializer;
+    use serde_json::Value;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+
+        match value {
+            Value::String(s) => Ok(Some(s)),
+            Value::Object(map) => {
+                if let Some(content) = map.get("content").and_then(|v| v.as_str()) {
+                    Ok(Some(content.to_string()))
+                } else {
+                    Err(de::Error::custom(
+                        "content key not found in structured token",
+                    ))
+                }
+            }
+            _ => Err(de::Error::custom("invalid token format")),
+        }
     }
 }
 
@@ -86,7 +172,7 @@ pub struct Info {
     pub docker_label: Option<&'static str>,
 }
 
-#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, ToSchema, Default)]
 pub(crate) struct GenerateParameters {
     #[serde(default)]
     #[schema(exclusive_minimum = 0, nullable = true, default = "null", example = 1)]
@@ -171,6 +257,8 @@ pub(crate) struct GenerateParameters {
     #[serde(default)]
     #[schema(exclusive_minimum = 0, nullable = true, default = "null", example = 5)]
     pub top_n_tokens: Option<u32>,
+    #[serde(default)]
+    pub grammar: Option<GrammarType>,
 }
 
 fn default_max_new_tokens() -> Option<u32> {
@@ -196,6 +284,7 @@ fn default_parameters() -> GenerateParameters {
         decoder_input_details: false,
         seed: None,
         top_n_tokens: None,
+        grammar: None,
     }
 }
 
@@ -308,6 +397,7 @@ impl ChatCompletion {
                 message: Message {
                     role: "assistant".into(),
                     content: output,
+                    name: None,
                 },
                 logprobs: return_logprobs
                     .then(|| ChatCompletionLogprobs::from((details.tokens, details.top_tokens))),
@@ -383,6 +473,7 @@ fn default_request_messages() -> Vec<Message> {
     vec![Message {
         role: "user".to_string(),
         content: "My name is David and I".to_string(),
+        name: None,
     }]
 }
 
@@ -477,6 +568,8 @@ pub(crate) struct Message {
     pub role: String,
     #[schema(example = "My name is David and I")]
     pub content: String,
+    #[schema(example = "\"David\"")]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -638,6 +731,8 @@ pub(crate) struct ErrorResponse {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use tokenizers::Tokenizer;
 
     pub(crate) async fn get_tokenizer() -> Tokenizer {
@@ -645,5 +740,58 @@ mod tests {
         let repo = api.model("gpt2".to_string());
         let filename = repo.get("tokenizer.json").unwrap();
         Tokenizer::from_file(filename).unwrap()
+    }
+
+    #[test]
+    fn test_hub_nested_tokens_tokenizer_config() {
+        // this is a subset of the tokenizer.json file
+        // in this case we expect the tokens to be encoded as simple strings
+        let json_content = r#"{
+            "chat_template": "test",
+            "bos_token": "<｜begin▁of▁sentence｜>",
+            "eos_token": "<｜end▁of▁sentence｜>"
+        }"#;
+
+        let config: HubTokenizerConfig = serde_json::from_str(json_content).unwrap();
+
+        // check that we successfully parsed the tokens
+        assert_eq!(config.chat_template, Some("test".to_string()));
+        assert_eq!(
+            config.bos_token,
+            Some("<｜begin▁of▁sentence｜>".to_string())
+        );
+        assert_eq!(config.eos_token, Some("<｜end▁of▁sentence｜>".to_string()));
+
+        // in this case we expect the tokens to be encoded as structured tokens
+        // we want the content of the structured token
+        let json_content = r#"{
+            "chat_template": "test",
+            "bos_token": {
+              "__type": "AddedToken",
+              "content": "<｜begin▁of▁sentence｜>",
+              "lstrip": false,
+              "normalized": true,
+              "rstrip": false,
+              "single_word": false
+            },
+            "eos_token": {
+              "__type": "AddedToken",
+              "content": "<｜end▁of▁sentence｜>",
+              "lstrip": false,
+              "normalized": true,
+              "rstrip": false,
+              "single_word": false
+            }
+        }"#;
+
+        let config: HubTokenizerConfig = serde_json::from_str(json_content).unwrap();
+
+        // check that we successfully parsed the tokens
+        assert_eq!(config.chat_template, Some("test".to_string()));
+        assert_eq!(
+            config.bos_token,
+            Some("<｜begin▁of▁sentence｜>".to_string())
+        );
+        assert_eq!(config.eos_token, Some("<｜end▁of▁sentence｜>".to_string()));
     }
 }

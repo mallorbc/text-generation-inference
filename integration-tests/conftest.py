@@ -16,7 +16,14 @@ from syrupy.extensions.json import JSONSnapshotExtension
 from aiohttp import ClientConnectorError, ClientOSError, ServerDisconnectedError
 
 from text_generation import AsyncClient
-from text_generation.types import Response, Details, InputToken, Token, BestOfSequence
+from text_generation.types import (
+    Response,
+    Details,
+    InputToken,
+    Token,
+    BestOfSequence,
+    Grammar,
+)
 
 DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", None)
 HUGGING_FACE_HUB_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN", None)
@@ -224,6 +231,7 @@ def launcher(event_loop):
         quantize: Optional[str] = None,
         trust_remote_code: bool = False,
         use_flash_attention: bool = True,
+        disable_grammar_support: bool = False,
         dtype: Optional[str] = None,
     ):
         port = random.randint(8000, 10_000)
@@ -247,6 +255,8 @@ def launcher(event_loop):
 
         env = os.environ
 
+        if disable_grammar_support:
+            args.append("--disable-grammar-support")
         if num_shard is not None:
             args.extend(["--num-shard", str(num_shard)])
         if quantize is not None:
@@ -287,12 +297,15 @@ def launcher(event_loop):
         quantize: Optional[str] = None,
         trust_remote_code: bool = False,
         use_flash_attention: bool = True,
+        disable_grammar_support: bool = False,
         dtype: Optional[str] = None,
     ):
         port = random.randint(8000, 10_000)
 
         args = ["--model-id", model_id, "--env"]
 
+        if disable_grammar_support:
+            args.append("--disable-grammar-support")
         if num_shard is not None:
             args.extend(["--num-shard", str(num_shard)])
         if quantize is not None:
@@ -317,7 +330,10 @@ def launcher(event_loop):
 
         gpu_count = num_shard if num_shard is not None else 1
 
-        env = {"LOG_LEVEL": "info,text_generation_router=debug"}
+        env = {
+            "LOG_LEVEL": "info,text_generation_router=debug",
+            "ENABLE_CUDA_GRAPHS": "true",
+        }
         if not use_flash_attention:
             env["USE_FLASH_ATTENTION"] = "false"
 
@@ -367,11 +383,22 @@ def launcher(event_loop):
 @pytest.fixture(scope="module")
 def generate_load():
     async def generate_load_inner(
-        client: AsyncClient, prompt: str, max_new_tokens: int, n: int
+        client: AsyncClient,
+        prompt: str,
+        max_new_tokens: int,
+        n: int,
+        seed: Optional[int] = None,
+        grammar: Optional[Grammar] = None,
+        stop_sequences: Optional[List[str]] = None,
     ) -> List[Response]:
         futures = [
             client.generate(
-                prompt, max_new_tokens=max_new_tokens, decoder_input_details=True
+                prompt,
+                max_new_tokens=max_new_tokens,
+                decoder_input_details=True,
+                seed=seed,
+                grammar=grammar,
+                stop_sequences=stop_sequences,
             )
             for _ in range(n)
         ]

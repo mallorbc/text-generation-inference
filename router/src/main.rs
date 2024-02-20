@@ -75,6 +75,8 @@ struct Args {
     ngrok_edge: Option<String>,
     #[clap(long, env, default_value_t = false)]
     messages_api_enabled: bool,
+    #[clap(long, env, default_value_t = false)]
+    disable_grammar_support: bool,
 }
 
 #[tokio::main]
@@ -108,6 +110,7 @@ async fn main() -> Result<(), RouterError> {
         ngrok_authtoken,
         ngrok_edge,
         messages_api_enabled,
+        disable_grammar_support,
     } = args;
 
     // Launch Tokio runtime
@@ -325,6 +328,15 @@ async fn main() -> Result<(), RouterError> {
     tracing::info!("Setting max batch total tokens to {max_supported_batch_total_tokens}");
     tracing::info!("Connected");
 
+    // Determine the server port based on the feature and environment variable.
+    let port = if cfg!(feature = "google") {
+        std::env::var("AIP_HTTP_PORT")
+            .map(|aip_http_port| aip_http_port.parse::<u16>().unwrap_or(port))
+            .unwrap_or(port)
+    } else {
+        port
+    };
+
     let addr = match hostname.parse() {
         Ok(ip) => SocketAddr::new(ip, port),
         Err(_) => {
@@ -359,6 +371,7 @@ async fn main() -> Result<(), RouterError> {
         ngrok_edge,
         tokenizer_config,
         messages_api_enabled,
+        disable_grammar_support,
     )
     .await?;
     Ok(())
