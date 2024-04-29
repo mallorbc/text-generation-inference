@@ -9,6 +9,7 @@ import json
 import math
 import time
 import random
+import re
 
 from docker.errors import NotFound
 from typing import Optional, List, Dict
@@ -23,6 +24,10 @@ from text_generation.types import (
     Token,
     BestOfSequence,
     Grammar,
+    ChatComplete,
+    ChatCompletionChunk,
+    ChatCompletionComplete,
+    Completion,
 )
 
 DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", None)
@@ -40,8 +45,16 @@ class ResponseComparator(JSONSnapshotExtension):
         exclude=None,
         matcher=None,
     ):
+        if (
+            isinstance(data, Response)
+            or isinstance(data, ChatComplete)
+            or isinstance(data, ChatCompletionChunk)
+            or isinstance(data, ChatCompletionComplete)
+        ):
+            data = data.model_dump()
+
         if isinstance(data, List):
-            data = [d.dict() for d in data]
+            data = [d.model_dump() for d in data]
 
         data = self._filter(
             data=data, depth=0, path=(), exclude=exclude, matcher=matcher
@@ -56,10 +69,24 @@ class ResponseComparator(JSONSnapshotExtension):
     ) -> bool:
         def convert_data(data):
             data = json.loads(data)
+            if isinstance(data, Dict) and "choices" in data:
+                choices = data["choices"]
+                if isinstance(choices, List) and len(choices) >= 1:
+                    if "delta" in choices[0]:
+                        return ChatCompletionChunk(**data)
+                    if "text" in choices[0]:
+                        return Completion(**data)
+                return ChatComplete(**data)
 
             if isinstance(data, Dict):
                 return Response(**data)
             if isinstance(data, List):
+                if (
+                    len(data) > 0
+                    and "object" in data[0]
+                    and data[0]["object"] == "text_completion"
+                ):
+                    return [Completion(**d) for d in data]
                 return [Response(**d) for d in data]
             raise NotImplementedError
 
@@ -141,6 +168,19 @@ class ResponseComparator(JSONSnapshotExtension):
                 )
             )
 
+        def eq_completion(response: Completion, other: Completion) -> bool:
+            return response.choices[0].text == other.choices[0].text
+
+        def eq_chat_complete(response: ChatComplete, other: ChatComplete) -> bool:
+            return (
+                response.choices[0].message.content == other.choices[0].message.content
+            )
+
+        def eq_chat_complete_chunk(
+            response: ChatCompletionChunk, other: ChatCompletionChunk
+        ) -> bool:
+            return response.choices[0].delta.content == other.choices[0].delta.content
+
         def eq_response(response: Response, other: Response) -> bool:
             return response.generated_text == other.generated_text and eq_details(
                 response.details, other.details
@@ -153,6 +193,24 @@ class ResponseComparator(JSONSnapshotExtension):
             serialized_data = [serialized_data]
         if not isinstance(snapshot_data, List):
             snapshot_data = [snapshot_data]
+
+        if isinstance(serialized_data[0], Completion):
+            return len(snapshot_data) == len(serialized_data) and all(
+                [eq_completion(r, o) for r, o in zip(serialized_data, snapshot_data)]
+            )
+
+        if isinstance(serialized_data[0], ChatComplete):
+            return len(snapshot_data) == len(serialized_data) and all(
+                [eq_chat_complete(r, o) for r, o in zip(serialized_data, snapshot_data)]
+            )
+
+        if isinstance(serialized_data[0], ChatCompletionChunk):
+            return len(snapshot_data) == len(serialized_data) and all(
+                [
+                    eq_chat_complete_chunk(r, o)
+                    for r, o in zip(serialized_data, snapshot_data)
+                ]
+            )
 
         return len(snapshot_data) == len(serialized_data) and all(
             [eq_response(r, o) for r, o in zip(serialized_data, snapshot_data)]
@@ -233,6 +291,10 @@ def launcher(event_loop):
         use_flash_attention: bool = True,
         disable_grammar_support: bool = False,
         dtype: Optional[str] = None,
+        revision: Optional[str] = None,
+        max_input_length: Optional[int] = None,
+        max_batch_prefill_tokens: Optional[int] = None,
+        max_total_tokens: Optional[int] = None,
     ):
         port = random.randint(8000, 10_000)
         master_port = random.randint(10_000, 20_000)
@@ -265,8 +327,20 @@ def launcher(event_loop):
         if dtype is not None:
             args.append("--dtype")
             args.append(dtype)
+        if revision is not None:
+            args.append("--revision")
+            args.append(revision)
         if trust_remote_code:
             args.append("--trust-remote-code")
+        if max_input_length:
+            args.append("--max-input-length")
+            args.append(str(max_input_length))
+        if max_batch_prefill_tokens:
+            args.append("--max-batch-prefill-tokens")
+            args.append(str(max_batch_prefill_tokens))
+        if max_total_tokens:
+            args.append("--max-total-tokens")
+            args.append(str(max_total_tokens))
 
         env["LOG_LEVEL"] = "info,text_generation_router=debug"
 
@@ -299,6 +373,10 @@ def launcher(event_loop):
         use_flash_attention: bool = True,
         disable_grammar_support: bool = False,
         dtype: Optional[str] = None,
+        revision: Optional[str] = None,
+        max_input_length: Optional[int] = None,
+        max_batch_prefill_tokens: Optional[int] = None,
+        max_total_tokens: Optional[int] = None,
     ):
         port = random.randint(8000, 10_000)
 
@@ -314,8 +392,20 @@ def launcher(event_loop):
         if dtype is not None:
             args.append("--dtype")
             args.append(dtype)
+        if revision is not None:
+            args.append("--revision")
+            args.append(revision)
         if trust_remote_code:
             args.append("--trust-remote-code")
+        if max_input_length:
+            args.append("--max-input-length")
+            args.append(str(max_input_length))
+        if max_batch_prefill_tokens:
+            args.append("--max-batch-prefill-tokens")
+            args.append(str(max_batch_prefill_tokens))
+        if max_total_tokens:
+            args.append("--max-total-tokens")
+            args.append(str(max_total_tokens))
 
         client = docker.from_env()
 
@@ -332,7 +422,6 @@ def launcher(event_loop):
 
         env = {
             "LOG_LEVEL": "info,text_generation_router=debug",
-            "ENABLE_CUDA_GRAPHS": "true",
         }
         if not use_flash_attention:
             env["USE_FLASH_ATTENTION"] = "false"

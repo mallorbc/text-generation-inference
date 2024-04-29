@@ -28,11 +28,16 @@ from text_generation_server.models.cache_manager import (
     BLOCK_SIZE,
 )
 from text_generation_server.pb import generate_pb2
-from text_generation_server.models.globals import MEM_POOL, ENABLE_CUDA_GRAPHS
+from text_generation_server.models.globals import MEM_POOL, CUDA_GRAPHS
 from text_generation_server.utils import StoppingCriteria, HeterogeneousNextTokenChooser
 from text_generation_server.utils.dist import MEMORY_FRACTION
 
 tracer = trace.get_tracer(__name__)
+from text_generation_server.utils.import_utils import (
+    IS_CUDA_SYSTEM,
+    IS_ROCM_SYSTEM,
+    IS_XPU_SYSTEM,
+)
 
 
 @dataclass
@@ -107,6 +112,19 @@ class FlashCausalLMBatch(Batch):
         )
 
     @classmethod
+    def batch_tokenized_inputs(cls, requests, tokenizer):
+        batch_inputs = []
+        max_truncation = 0
+        for r in requests:
+            batch_inputs.append(r.inputs)
+            max_truncation = max(max_truncation, r.truncate)
+
+        batch_tokenized_inputs = tokenizer(
+            batch_inputs, truncation=True, max_length=max_truncation
+        )["input_ids"]
+        return batch_tokenized_inputs
+
+    @classmethod
     def from_pb(
         cls,
         pb: generate_pb2.Batch,
@@ -114,16 +132,7 @@ class FlashCausalLMBatch(Batch):
         dtype: torch.dtype,
         device: torch.device,
     ) -> "FlashCausalLMBatch":
-        batch_inputs = []
-        max_truncation = 0
-        for r in pb.requests:
-            batch_inputs.append(r.inputs)
-            max_truncation = max(max_truncation, r.truncate)
-
-        batch_tokenized_inputs = tokenizer(
-            batch_inputs, truncation=True, max_length=max_truncation
-        )["input_ids"]
-
+        batch_tokenized_inputs = cls.batch_tokenized_inputs(pb.requests, tokenizer)
         position_ids = []
         speculative_ids = []
         cu_seqlen_prefill = [0]
@@ -165,6 +174,11 @@ class FlashCausalLMBatch(Batch):
             requests_idx_mapping[r.id] = i
 
             tokenized_input = tokenized_input[-r.truncate :]
+            if (
+                tokenized_input[0] == tokenizer.bos_token_id
+                and tokenized_input[1] == tokenizer.bos_token_id
+            ):
+                tokenized_input = tokenized_input[1:]
 
             input_length = len(tokenized_input)
             input_lengths.append(input_length)
@@ -530,6 +544,7 @@ class FlashCausalLMBatch(Batch):
         read_offsets = []
 
         next_token_chooser_parameters = []
+        fsm_grammar_states = []
         stopping_criterias = []
         top_n_tokens = []
 
@@ -578,6 +593,7 @@ class FlashCausalLMBatch(Batch):
             read_offsets.extend(batch.read_offsets)
 
             next_token_chooser_parameters.extend([r.parameters for r in batch.requests])
+            fsm_grammar_states.extend(batch.next_token_chooser.fsm_grammar_states)
             stopping_criterias.extend(batch.stopping_criterias)
 
             top_n_tokens.extend(batch.top_n_tokens)
@@ -593,6 +609,7 @@ class FlashCausalLMBatch(Batch):
             dtype=batches[0].next_token_chooser.dtype,
             device=batches[0].next_token_chooser.device,
             tokenizer=batches[0].next_token_chooser.tokenizer,
+            fsm_grammar_states=fsm_grammar_states,
         )
 
         speculative_ids = (
@@ -687,7 +704,7 @@ class FlashCausalLM(Model):
     def cuda_graph_warmup(self, bs: int, max_s: int, max_bt: int):
         input_ids = torch.zeros(bs, dtype=torch.int64, device=self.device)
         position_ids = torch.zeros(bs, dtype=torch.int32, device=self.device)
-        slots = torch.arange(bs, dtype=torch.int32, device=self.device)
+        slots = torch.arange(bs, dtype=torch.int64, device=self.device)
         input_lengths = torch.ones(bs, dtype=torch.int32, device=self.device) * max_s
         block_tables = (
             torch.arange(max_bt, dtype=torch.int32, device=self.device)
@@ -723,7 +740,7 @@ class FlashCausalLM(Model):
         torch.cuda.synchronize()
 
         with torch.cuda.graph(graph, pool=MEM_POOL):
-            self.cuda_graphs[bs]["logits"] = self.model.forward(
+            logits, speculative_logits = self.model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 cu_seqlen_prefill=None,
@@ -734,11 +751,16 @@ class FlashCausalLM(Model):
                 max_s=max_s,
                 lm_head_indices=None,
             )
+            self.cuda_graphs[bs]["logits"] = logits
+            self.cuda_graphs[bs]["speculative_logits"] = speculative_logits
         torch.cuda.synchronize()
 
     def warmup(self, batch: FlashCausalLMBatch):
         # The warmup batch is the biggest batch we could ever receive
-        torch.cuda.empty_cache()
+        if IS_CUDA_SYSTEM or IS_ROCM_SYSTEM:
+            torch.cuda.empty_cache()
+        elif IS_XPU_SYSTEM:
+            torch.xpu.empty_cache()
         try:
             cache_manager = set_cache_manager(
                 batch.blocks,
@@ -758,7 +780,10 @@ class FlashCausalLM(Model):
                 f"You need to decrease `--max-batch-prefill-tokens`"
             ) from e
 
-        torch.cuda.synchronize(self.device)
+        if IS_CUDA_SYSTEM or IS_ROCM_SYSTEM:
+            torch.cuda.synchronize(self.device)
+        elif IS_XPU_SYSTEM:
+            torch.xpu.synchronize(self.device)
 
         # Inspired by the original implementation in [vllm](https://github.com/vllm-project/vllm)
         # Calculate the number of blocks that can be allocated with the free memory
@@ -766,12 +791,20 @@ class FlashCausalLM(Model):
         cache_block_size = BLOCK_SIZE * self.num_kv_heads * self.head_size
         total_cache_size = self.num_layers * cache_block_size * 2 * dtype_size
 
-        total_free_memory, _ = torch.cuda.mem_get_info(self.device)
-        total_gpu_memory = torch.cuda.get_device_properties(self.device).total_memory
+        if IS_CUDA_SYSTEM or IS_ROCM_SYSTEM:
+            total_free_memory, _ = torch.cuda.mem_get_info(self.device)
+            total_gpu_memory = torch.cuda.get_device_properties(
+                self.device
+            ).total_memory
 
-        free_memory = max(
-            0, total_free_memory - (1 - MEMORY_FRACTION) * total_gpu_memory
-        )
+            free_memory = max(
+                0, total_free_memory - (1 - MEMORY_FRACTION) * total_gpu_memory
+            )
+        elif IS_XPU_SYSTEM:
+            total_gpu_memory = torch.xpu.get_device_properties(self.device).total_memory
+            free_memory = int(total_gpu_memory * 0.5)
+        else:
+            raise NotImplementedError("FlashModel is only available on GPU")
 
         num_blocks = (
             # Leave 5% for some wiggle room
@@ -793,19 +826,23 @@ class FlashCausalLM(Model):
             self.device,
         )
 
-        if ENABLE_CUDA_GRAPHS:
+        if CUDA_GRAPHS:
             try:
-                logger.info("Experimental support for Cuda Graphs is enabled")
+                logger.info(f"Cuda Graphs are enabled for sizes {CUDA_GRAPHS}")
                 # Warmup cuda graphs
-                for bs in [1, 2, 4] + [8 * i for i in range(8)]:
+                for bs in CUDA_GRAPHS:
                     if self.speculate is None or self.speculate + 1 <= bs:
                         self.cuda_graph_warmup(bs, max_s, max_bt)
-            except Exception:
+            except torch.cuda.OutOfMemoryError:
                 logger.exception(f"Decode cuda graph warmup failed")
+        else:
+            logger.info(f"Cuda Graphs are disabled (CUDA_GRAPHS={CUDA_GRAPHS}).")
 
         return int(num_blocks * BLOCK_SIZE)
 
-    def forward(self, batch: FlashCausalLMBatch) -> torch.Tensor:
+    def forward(
+        self, batch: FlashCausalLMBatch
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Model Forward
         if batch.speculative_ids is not None:
             input_ids = batch.input_ids
@@ -858,22 +895,14 @@ class FlashCausalLM(Model):
             lm_head_indices = batch.prefill_head_indices
 
         bs = input_ids.shape[0]
-        padded_bs = bs
-        if bs == 3:
-            padded_bs = 4
-        elif 3 < bs <= 8:
-            padded_bs = 8
-        elif bs > 8:
-            padded_bs = (bs + 7) // 8 * 8
+        sorted_padded_bs = sorted([k for k in self.cuda_graphs.keys() if k >= bs])
+        if sorted_padded_bs:
+            # Get associated cuda graph
+            cuda_graph = self.cuda_graphs[sorted_padded_bs[0]]
+        else:
+            cuda_graph = None
 
-        # Try to find an associated cuda graph
-        cuda_graph = self.cuda_graphs.get(padded_bs, None)
-
-        if (
-            cu_seqlen_prefill is not None
-            or cuda_graph is None
-            or batch.speculative_ids is not None
-        ):
+        if cu_seqlen_prefill is not None or cuda_graph is None:
             return self.model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -900,9 +929,14 @@ class FlashCausalLM(Model):
 
         # Replay the graph
         cuda_graph["graph"].replay()
-
         # Slice output to the correct shape
-        return cuda_graph["logits"][:bs]
+        speculative_logits = (
+            cuda_graph["speculative_logits"][:bs]
+            if cuda_graph["speculative_logits"] is not None
+            else None
+        )
+        logits = cuda_graph["logits"][:bs]
+        return logits, speculative_logits
 
     @tracer.start_as_current_span("generate_token")
     def generate_token(
@@ -926,15 +960,10 @@ class FlashCausalLM(Model):
             batch.slots = slots
 
         try:
-            out = self.forward(batch)
+            out, speculative_logits = self.forward(batch)
         except Exception as e:
             del batch
             raise e
-
-        if isinstance(out, tuple):
-            out, speculative_logits = out
-        else:
-            speculative_logits = None
 
         if prefill:
             next_token_logits = (

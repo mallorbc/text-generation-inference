@@ -4,10 +4,11 @@ import torch.distributed
 
 from torch import nn
 from torch.nn import functional as F
-from typing import List
+from typing import List, Tuple, Optional
 from loguru import logger
 from functools import lru_cache
 
+# Dummy comment.
 HAS_BITS_AND_BYTES = True
 try:
     import bitsandbytes as bnb
@@ -18,8 +19,14 @@ except ImportError:
 from accelerate import init_empty_weights
 
 from text_generation_server.utils.gptq.quant_linear import QuantLinear
-from text_generation_server.utils.import_utils import IS_CUDA_SYSTEM, IS_ROCM_SYSTEM
-from text_generation_server.utils.log import log_once
+from text_generation_server.utils.import_utils import (
+    IS_CUDA_SYSTEM,
+    IS_ROCM_SYSTEM,
+    IS_XPU_SYSTEM,
+)
+
+if IS_XPU_SYSTEM:
+    import intel_extension_for_pytorch as ipex
 
 HAS_AWQ = True
 try:
@@ -35,12 +42,6 @@ except Exception:
 HAS_EXLLAMA = False
 CAN_EXLLAMA = major >= 8 or IS_ROCM_SYSTEM
 V2 = os.getenv("EXLLAMA_VERSION", "2") == "2"
-# if V2 and int(os.getenv("WORLD_SIZE", "1")) > 1:
-#     V2 = False
-#     log_once(
-#         logger.warning,
-#         "Disabling exllama v2 and using v1 instead because there are issues when sharding",
-#     )
 
 if os.getenv("DISABLE_EXLLAMA") == "True":
     HAS_EXLLAMA = False
@@ -174,6 +175,8 @@ class EETQLinear(nn.Module):
     ) -> None:
         super().__init__()
         device = weight.device
+        if weight.dtype != torch.float16:
+            weight = weight.to(dtype=torch.float16)
         weight = torch.t(weight).contiguous().cpu()
         weight, scale = quant_weights(weight, torch.int8, False)
 
@@ -184,6 +187,48 @@ class EETQLinear(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         output = w8_a16_gemm(input, self.weight, self.scale)
         output = output + self.bias if self.bias is not None else output
+        return output
+
+
+def fp8_quantize(weight, qdtype=torch.float8_e4m3fn):
+    device = weight.device
+    # weight, scale = quant_weights(weight, torch.int8, False)
+    finfo = torch.finfo(qdtype)
+    # Calculate the scale as dtype max divided by absmax
+    scale = finfo.max / weight.abs().max().clamp(min=1e-12)
+    # scale and clamp the tensor to bring it to
+    # the representative range of float8 data type
+    # (as default cast is unsaturated)
+    qweight = (weight * scale).clamp(min=finfo.min, max=finfo.max)
+    # Return both float8 data and the inverse scale (as float),
+    # as both required as inputs to torch._scaled_mm
+    qweight = qweight.to(qdtype)
+    scale = scale.float().reciprocal()
+    return qweight, scale
+
+
+class Fp8Linear(nn.Module):
+    def __init__(
+        self,
+        weight,
+        bias,
+    ) -> None:
+        super().__init__()
+        self.dtype = weight.dtype
+        self.qweight, self.scale = fp8_quantize(weight)
+
+        self.bias = bias if bias is not None else None
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        qinput, scale = fp8_quantize(input)
+        output, _ = torch._scaled_mm(
+            qinput,
+            self.qweight.t(),
+            out_dtype=self.dtype,
+            scale_a=scale,
+            scale_b=self.scale,
+            bias=self.bias,
+        )
         return output
 
 
@@ -298,6 +343,8 @@ def get_linear(weight, bias, quantize):
             raise ImportError(
                 "Please install EETQ from https://github.com/NetEase-FuXi/EETQ"
             )
+    elif quantize == "fp8":
+        linear = Fp8Linear(weight, bias)
     elif quantize == "bitsandbytes":
         warn_deprecate_bnb()
         linear = Linear8bitLt(
@@ -380,6 +427,214 @@ class SuperLayer(nn.Module):
         return self.linear.forward(x)
 
 
+class ResBlock(torch.nn.Module):
+    def __init__(self, config, prefix, weights):
+        super().__init__()
+        self.linear = FastLinear.load(
+            config, prefix=f"{prefix}.linear", weights=weights, bias=True
+        )
+        self.act = torch.nn.SiLU()
+
+    def forward(self, x):
+        return x + self.act(self.linear(x))
+
+
+class MedusaModel(torch.nn.Module):
+    def __init__(self, config, medusa_config, weights):
+        super().__init__()
+        self.heads = torch.nn.ModuleList(
+            [
+                MedusaHead(config, medusa_config, prefix=f"{i}", weights=weights)
+                for i in range(medusa_config["medusa_num_heads"])
+            ]
+        )
+
+    def forward(self, x):
+        speculative_logits = torch.stack([head(x) for head in self.heads], dim=1)
+        return speculative_logits
+
+
+class MedusaHead(torch.nn.Module):
+    def __init__(self, config, medusa_config, prefix, weights):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            [
+                ResBlock(config, prefix=f"{prefix}.{i}", weights=weights)
+                for i in range(medusa_config["medusa_num_layers"])
+            ]
+        )
+        n = len(self.blocks)
+        self.out = FastLinear.load(
+            config, prefix=f"{prefix}.{n}", weights=weights, bias=False
+        )
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        x = self.out(x)
+        return x
+
+
+class MedusaHeadV1(nn.Module):
+    def __init__(self, lm_head, medusa):
+        super().__init__()
+        self.lm_head = lm_head
+        self.medusa = medusa
+
+    @staticmethod
+    def load(config, prefix: str, weights):
+        from pathlib import Path
+        from safetensors import safe_open
+        import json
+
+        use_medusa = config.use_medusa
+
+        medusa_config = str(Path(use_medusa) / "config.json")
+        filename = str(Path(use_medusa) / "medusa_lm_head.safetensors")
+
+        with open(medusa_config, "r") as f:
+            medusa_config = json.load(f)
+        routing = weights.routing
+        with safe_open(filename, framework="pytorch") as f:
+            for k in f.keys():
+                if k in routing and routing[k] != filename:
+                    raise RuntimeError(
+                        f"Key {k} was found in multiple files: {filename} and {routing[k]}"
+                    )
+                routing[k] = filename
+
+        medusa = MedusaModel(config, medusa_config, weights)
+        lm_head = TensorParallelHead.load(config, prefix, weights)
+        return MedusaHeadV1(lm_head, medusa)
+
+    def forward(
+        self, input: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        logits = self.lm_head(input)
+        # If we have too many tokens, we skip speculative logits
+        if input.shape[0] > 128:
+            return logits, None
+
+        speculative_logits = self.medusa(input)
+        return logits, speculative_logits
+
+
+class MedusaHeadV2(nn.Module):
+    def __init__(self, config, prefix, weights):
+        super().__init__()
+        from pathlib import Path
+        from safetensors import safe_open
+        import json
+
+        use_medusa = config.use_medusa
+
+        medusa_config = str(Path(use_medusa) / "config.json")
+        filename = str(Path(use_medusa) / "medusa_lm_head.safetensors")
+
+        with open(medusa_config, "r") as f:
+            medusa_config = json.load(f)
+        routing = weights.routing
+        with safe_open(filename, framework="pytorch") as f:
+            for k in f.keys():
+                if k in routing and routing[k] != filename:
+                    raise RuntimeError(
+                        f"Key {k} was found in multiple files: {filename} and {routing[k]}"
+                    )
+                routing[k] = filename
+
+        self.n_medusa_heads = medusa_config["medusa_num_heads"]
+
+        assert medusa_config["medusa_num_layers"] == 1
+        self.linear = TensorParallelColumnLinear.load_multi(
+            config,
+            prefixes=[f"{i}.0.linear" for i in range(self.n_medusa_heads)],
+            dim=0,
+            weights=weights,
+            bias=True,
+        )
+        self.process_group = weights.process_group
+        self.world_size = self.process_group.size()
+        self.rank = self.process_group.rank()
+
+        self.act = torch.nn.SiLU()
+
+        self.lm_head = TensorParallelHead.load(config, prefix, weights)
+
+    def forward(self, x):
+        # If we have too many tokens, we skip speculative logits
+        if x.shape[0] > 128:
+            logits = self.lm_head(x)
+            return logits, None
+
+        size = x.shape[-1]
+        block_size = (size + self.world_size - 1) // self.world_size
+        start = self.rank * block_size
+        stop = (self.rank + 1) * block_size
+
+        x_block = x[:, start:stop]
+
+        # Compute all medusa heads at the same time, then reshape and move the n_medusa_heads dim to dim 1
+        medusa_res = self.act(self.linear(x)).reshape(
+            *x_block.shape[:-1], self.n_medusa_heads, x_block.shape[-1]
+        )
+
+        # Apply all residual medusa heads
+        output = x[:, start:stop].unsqueeze(-2) + medusa_res
+
+        # Gather medusa heads
+        world_output = [
+            torch.empty_like(output) for _ in range(self.process_group.size())
+        ]
+        torch.distributed.all_gather(world_output, output, group=self.process_group)
+        world_output = torch.cat(world_output, dim=-1)
+
+        # Stack x and medusa residual x
+        stacked_x = torch.cat([x.unsqueeze(-2), world_output], dim=-2)
+
+        # Compute lm head on x + medusa residual x
+        logits = self.lm_head(stacked_x)
+
+        # Finally, split logits from speculative logits
+        logits, speculative_logits = torch.split(
+            logits, [1, self.n_medusa_heads], dim=-2
+        )
+        # Squeeze added dimension
+        logits = logits.squeeze(-2)
+
+        return logits, speculative_logits
+
+
+class SpeculativeHead(nn.Module):
+    def __init__(self, lm_head, medusa):
+        super().__init__()
+        self.head = lm_head
+        self.medusa = medusa
+
+    @staticmethod
+    def load(config, prefix: str, weights):
+        use_medusa = config.use_medusa
+        if use_medusa:
+            lm_head = None
+            try:
+                medusa = MedusaHeadV1.load(config, prefix, weights)
+            except:
+                medusa = MedusaHeadV2(config, prefix, weights)
+        else:
+            lm_head = TensorParallelHead.load(config, prefix, weights)
+            medusa = None
+        return SpeculativeHead(lm_head, medusa)
+
+    def forward(
+        self, input: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.medusa is not None:
+            return self.medusa(input)
+
+        assert self.head is not None
+        logits = self.head(input)
+        return logits, None
+
+
 class TensorParallelHead(SuperLayer):
     def __init__(self, linear, process_group, should_gather: bool):
         super().__init__(linear)
@@ -449,6 +704,19 @@ class TensorParallelHead(SuperLayer):
 
 
 class TensorParallelColumnLinear(SuperLayer):
+    @classmethod
+    def load_gate_up(cls, config, prefix: str, weights, bias: bool):
+        """Specific method when the QKV was joined after the fact"""
+        weight = weights.get_weights_col_packed_gate_up(
+            prefix, quantize=config.quantize
+        )
+        if bias:
+            raise NotImplementedError("packed_gate_up only implemented without bias")
+        else:
+            bias = None
+        linear = get_linear(weight, bias, config.quantize)
+        return cls(linear)
+
     @classmethod
     def load_qkv(cls, config, prefix: str, weights, bias: bool):
         """Specific method when the QKV was joined after the fact"""
@@ -552,7 +820,15 @@ try:
 
     class FastLayerNorm(nn.LayerNorm):
         def forward(self, hidden_states, residual=None):
-            if hidden_states.shape[-1] > 8192 or IS_ROCM_SYSTEM:
+            if IS_XPU_SYSTEM:
+                res_out = hidden_states
+                out = ipex.llm.functional.add_layer_norm(
+                    residual, hidden_states, self.weight, self.bias, self.eps, True
+                )
+                if residual is not None:
+                    res_out = residual
+                return out, res_out
+            elif hidden_states.shape[-1] > 8192 or IS_ROCM_SYSTEM:
                 if residual is not None:
                     hidden_states += residual
                 residual = hidden_states
@@ -598,7 +874,20 @@ try:
             return cls(weight, eps)
 
         def forward(self, hidden_states, residual=None):
-            if hidden_states.shape[-1] > 8192:
+            if IS_XPU_SYSTEM:
+                residual_out = hidden_states
+                out = ipex.llm.functional.add_rms_norm(
+                    residual,
+                    hidden_states,
+                    self.weight,
+                    None,
+                    self.variance_epsilon,
+                    True,
+                )
+                if residual is not None:
+                    residual_out = residual
+                return out, residual_out
+            elif hidden_states.shape[-1] > 8192:
                 if residual is not None:
                     hidden_states += residual
                 residual = hidden_states
@@ -724,6 +1013,10 @@ try:
 
                 # Inplace operation, updating query and key.
                 pos_encoding_ops.rotary_embedding(query, key, head_size, cos, sin, True)
+            elif IS_XPU_SYSTEM:
+                ipex.llm.functional.rotary_embedding(
+                    query, key, sin, cos, query.size(-1), True
+                )
             else:
                 raise ValueError(
                     "Your system seem to be not supported. Please check your install or open an issue at https://github.com/huggingface/text-generation-inference/issues with a clear reproduction."
@@ -843,6 +1136,7 @@ try:
 
             cos = torch.index_select(self._cos_cached, 0, position_ids)
             sin = torch.index_select(self._sin_cached, 0, position_ids)
+
             # Note: this unsqueeze is not necessary on RoCm + VLLM ROPE implementation, but we leave it as is to avoid yet an other controlflow.
             return cos.unsqueeze(1), sin.unsqueeze(1)
 

@@ -2,14 +2,13 @@ import torch
 import torch.distributed
 
 from opentelemetry import trace
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 from transformers.models.llama import LlamaTokenizer
 from typing import Optional
 
 from text_generation_server.models import FlashCausalLM
 from text_generation_server.models.custom_modeling.flash_llama_modeling import (
     FlashLlamaForCausalLM,
-    LlamaConfig,
 )
 from text_generation_server.utils import (
     initialize_torch_distributed,
@@ -19,6 +18,8 @@ from text_generation_server.utils import (
 
 tracer = trace.get_tracer(__name__)
 
+from text_generation_server.utils.import_utils import IS_XPU_SYSTEM
+
 
 class FlashLlama(FlashCausalLM):
     def __init__(
@@ -26,13 +27,16 @@ class FlashLlama(FlashCausalLM):
         model_id: str,
         revision: Optional[str] = None,
         quantize: Optional[str] = None,
+        use_medusa: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
-        use_medusa: Optional[str] = None,
     ):
         self.process_group, rank, world_size = initialize_torch_distributed()
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
+            dtype = torch.float16 if dtype is None else dtype
+        elif IS_XPU_SYSTEM:
+            device = torch.device(f"xpu:{rank}")
             dtype = torch.float16 if dtype is None else dtype
         else:
             raise NotImplementedError("FlashLlama is only available on GPU")
@@ -53,11 +57,21 @@ class FlashLlama(FlashCausalLM):
                 truncation_side="left",
                 trust_remote_code=trust_remote_code,
             )
+        try:
+            generation_config = GenerationConfig.from_pretrained(
+                model_id, revision=revision, trust_remote_code=trust_remote_code
+            )
+            if isinstance(generation_config.eos_token_id, (list, set)):
+                # TODO Huge hack
+                tokenizer._eos_token_ids = set(generation_config.eos_token_id)
+        except Exception:
+            pass
 
-        config = LlamaConfig.from_pretrained(
+        config = AutoConfig.from_pretrained(
             model_id, revision=revision, trust_remote_code=trust_remote_code
         )
         config.quantize = quantize
+        config.use_medusa = use_medusa
 
         torch.distributed.barrier(group=self.process_group)
 
@@ -66,38 +80,8 @@ class FlashLlama(FlashCausalLM):
         if config.quantize in ["gptq", "awq"]:
             weights._set_gptq_params(model_id, revision)
 
-        model = FlashLlamaForCausalLM(config, weights)
-        if use_medusa:
-            from text_generation_server.utils.medusa import MedusaModel
-            from huggingface_hub import hf_hub_download
-            import json
-            import os
-            from pathlib import Path
-
-            is_local_model = (
-                Path(use_medusa).exists() and Path(use_medusa).is_dir()
-            ) or os.getenv("WEIGHTS_CACHE_OVERRIDE", None) is not None
-
-            if not is_local_model:
-                medusa_config = hf_hub_download(
-                    use_medusa, revision=revision, filename="config.json"
-                )
-                medusa_head = hf_hub_download(
-                    use_medusa, revision=revision, filename="medusa_lm_head.pt"
-                )
-            else:
-                medusa_config = str(Path(use_medusa) / "config.json")
-                medusa_head = str(Path(use_medusa) / "medusa_lm_head.pt")
-
-            with open(medusa_config, "r") as f:
-                config = json.load(f)
-            medusa_sf = medusa_head[: -len(".pt")] + ".safetensors"
-            weights = Weights(
-                [medusa_sf], device, dtype, process_group=self.process_group
-            )
-            lm_head = model.lm_head
-            model.lm_head = MedusaModel(config, weights, lm_head)
-
+        prefix = ""
+        model = FlashLlamaForCausalLM(prefix, config, weights)
         torch.distributed.barrier(group=self.process_group)
         super(FlashLlama, self).__init__(
             model=model,
